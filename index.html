@@ -139,59 +139,38 @@ function bfsDistances(startId) {
   return dist;
 }
 
-// ---- POISSON DISK SAMPLING ON GRAPH ----
-function placeTreasures(minSpacing, maxSpacing) {
-  const isChest = new Array(dots.length).fill(false);
-  const chestIds = [];
-
-  // Shuffle dot order for randomness
-  const order = dots.map((_, i) => i);
-  for (let i = order.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [order[i], order[j]] = [order[j], order[i]];
-  }
-
-  // Greedy placement: try each dot in random order
-  for (const id of order) {
-    // Check if this dot is at least minSpacing from all existing chests
-    let tooClose = false;
-    for (const cid of chestIds) {
-      const dist = bfsDistances(cid);
-      if (dist[id] < minSpacing) {
-        tooClose = true;
-        break;
-      }
-    }
-    if (!tooClose) {
-      isChest[id] = true;
-      chestIds.push(id);
-    }
-  }
-
-  // Check coverage: find dots that are too far from any chest
-  const uncovered = [];
-  for (let i = 0; i < dots.length; i++) {
-    let minDist = Infinity;
-    for (const cid of chestIds) {
-      const dist = bfsDistances(cid);
-      if (dist[i] < minDist) minDist = dist[i];
-    }
-    if (minDist > maxSpacing) uncovered.push(i);
-  }
-
-  return { chestIds, uncovered };
-}
-
-// ---- OPTIMIZED VERSION: precompute all BFS ----
-// Since we have only 141 dots, we can precompute all-pairs distances
+// ---- PRECOMPUTE ----
 const allDist = [];
 for (let i = 0; i < dots.length; i++) {
   allDist.push(bfsDistances(i));
 }
 
+// Precompute angles for all dots
+const dotAngles = dots.map(d => (Math.atan2(d.y, d.x) * 180 / Math.PI + 360) % 360);
+
+// ---- RADIAL LINE DETECTION ----
+// Check how many existing chests are roughly aligned radially with a candidate
+// "Radially aligned" = within angularTolerance degrees AND on different rings
+function radialLineScore(candidateId, chestIds, angularTolerance) {
+  const cAngle = dotAngles[candidateId];
+  const cRing = dots[candidateId].ring;
+  let aligned = 0;
+  for (const cid of chestIds) {
+    if (dots[cid].ring === cRing) continue; // same ring doesn't count
+    if (dots[cid].ring === -1) continue; // skip center
+    if (angularDiff(dotAngles[cid], cAngle) < angularTolerance) {
+      aligned++;
+    }
+  }
+  return aligned;
+}
+
+// ---- PLACEMENT ----
 function placeTreasuresFast(closeRatio) {
   const chestIds = [];
   const blocked = new Array(dots.length).fill(false);
+  const RADIAL_TOLERANCE = 8; // degrees - how close in angle = "looks like a line"
+  const RADIAL_MAX = 1; // max allowed radially aligned chests before penalty
 
   // Shuffle for randomness
   const order = dots.map((_, i) => i);
@@ -200,8 +179,27 @@ function placeTreasuresFast(closeRatio) {
     [order[i], order[j]] = [order[j], order[i]];
   }
 
-  // Phase 1: Place chests with min spacing 2
+  // Phase 1: Place chests with min spacing 2, avoiding radial lines
+  // First pass: collect all valid candidates
+  const phase1Candidates = [];
   for (const id of order) {
+    phase1Candidates.push(id);
+  }
+
+  for (const id of phase1Candidates) {
+    if (blocked[id]) continue;
+    // Check radial alignment - skip if it would create a line of 3+
+    if (dots[id].ring >= 0 && radialLineScore(id, chestIds, RADIAL_TOLERANCE) > RADIAL_MAX) {
+      continue;
+    }
+    chestIds.push(id);
+    for (let j = 0; j < dots.length; j++) {
+      if (allDist[id][j] < 2) blocked[j] = true;
+    }
+  }
+
+  // Second pass: fill gaps that the radial filter left, with relaxed rules
+  for (const id of phase1Candidates) {
     if (blocked[id]) continue;
     chestIds.push(id);
     for (let j = 0; j < dots.length; j++) {
@@ -209,7 +207,7 @@ function placeTreasuresFast(closeRatio) {
     }
   }
 
-  // Phase 2: Add more chests at min spacing 1 based on closeRatio
+  // Phase 2: spacing-1 chests, distributed angularly
   const chestSet = new Set(chestIds);
   const candidates = [];
   for (const id of order) {
@@ -218,21 +216,15 @@ function placeTreasuresFast(closeRatio) {
     if (hasAdjacentChest) candidates.push(id);
   }
 
-  // closeRatio 0 = no close chests, 1 = as many as possible
   const toAdd = Math.round(chestIds.length * (closeRatio / (1 - closeRatio + 0.001)));
 
-  // Distribute spacing-1 chests evenly around the circle using angular sectors
-  // Assign each candidate an angle, then divide into sectors and pick one per sector
-  const candidatesWithAngle = candidates.map(id => {
-    const d = dots[id];
-    const angle = (Math.atan2(d.y, d.x) * 180 / Math.PI + 360) % 360;
-    return { id, angle };
-  });
-
-  // Sort by angle
+  const candidatesWithAngle = candidates.map(id => ({
+    id,
+    angle: dotAngles[id],
+    radialScore: radialLineScore(id, chestIds, RADIAL_TOLERANCE)
+  }));
   candidatesWithAngle.sort((a, b) => a.angle - b.angle);
 
-  // Divide the circle into toAdd equal sectors, pick one candidate per sector
   const sectorSize = 360 / Math.max(toAdd, 1);
   const closeChestSet = new Set();
   let added = 0;
@@ -241,25 +233,19 @@ function placeTreasuresFast(closeRatio) {
     const sectorStart = (s * sectorSize) % 360;
     const sectorEnd = ((s + 1) * sectorSize) % 360;
 
-    // Find candidates in this sector
     const inSector = candidatesWithAngle.filter(c => {
       if (sectorStart < sectorEnd) {
         return c.angle >= sectorStart && c.angle < sectorEnd;
       } else {
-        // Wraps around 360
         return c.angle >= sectorStart || c.angle < sectorEnd;
       }
     });
 
     if (inSector.length === 0) continue;
 
-    // Shuffle candidates within the sector for randomness
-    for (let i = inSector.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [inSector[i], inSector[j]] = [inSector[j], inSector[i]];
-    }
+    // Sort by radial score (prefer lower = less aligned), then shuffle ties
+    inSector.sort((a, b) => a.radialScore - b.radialScore);
 
-    // Pick first valid candidate (not adjacent to another spacing-1 chest)
     for (const c of inSector) {
       const tooCloseToAnother = dots[c.id].neighbors.some(nid => closeChestSet.has(nid));
       if (tooCloseToAnother) continue;
@@ -335,7 +321,6 @@ function render(chestIds, closeChestSet) {
     if (chestSet.has(d.id)) {
       dot.setAttribute('r', 8);
       if (closeChestSet && closeChestSet.has(d.id)) {
-        // Close-spaced chests get a different look
         dot.setAttribute('fill', '#FF8C00');
         dot.setAttribute('stroke', '#B8860B');
         dot.setAttribute('stroke-width', '2');
@@ -344,6 +329,8 @@ function render(chestIds, closeChestSet) {
         dot.setAttribute('stroke', '#B8860B');
         dot.setAttribute('stroke-width', '2');
       }
+      dot.style.cursor = 'pointer';
+      dot.addEventListener('click', () => relocateChest(d.id));
     } else {
       dot.setAttribute('r', 4);
       dot.setAttribute('fill', '#ff00ff');
@@ -353,6 +340,81 @@ function render(chestIds, closeChestSet) {
 }
 
 let currentCloseChestSet = null;
+
+// ---- CLICK TO RELOCATE ----
+function relocateChest(oldId) {
+  const chestSet = new Set(currentChests);
+
+  // Remove the clicked chest
+  chestSet.delete(oldId);
+  if (currentCloseChestSet) currentCloseChestSet.delete(oldId);
+
+  // Find valid new positions: not already a chest, respects min spacing 2 from others
+  const candidates = [];
+  for (let i = 0; i < dots.length; i++) {
+    if (chestSet.has(i)) continue;
+    let tooClose = false;
+    for (const cid of chestSet) {
+      if (allDist[cid][i] < 2) { tooClose = true; break; }
+    }
+    if (tooClose) continue;
+    // Score by radial alignment (lower = better)
+    const rScore = radialLineScore(i, [...chestSet], 8);
+    candidates.push({ id: i, rScore });
+  }
+
+  if (candidates.length === 0) {
+    // No valid spot found, put it back
+    return;
+  }
+
+  // Sort: prefer low radial score, then shuffle among the best
+  candidates.sort((a, b) => a.rScore - b.rScore);
+  const bestScore = candidates[0].rScore;
+  const bestCandidates = candidates.filter(c => c.rScore === bestScore);
+
+  // Pick random from best
+  const pick = bestCandidates[Math.floor(Math.random() * bestCandidates.length)];
+
+  // Update currentChests
+  currentChests = currentChests.filter(id => id !== oldId);
+  currentChests.push(pick.id);
+
+  render(currentChests, currentCloseChestSet);
+  updateStats();
+}
+
+function updateStats() {
+  const chestSet = new Set(currentChests);
+  const closeCount = currentCloseChestSet ? [...currentCloseChestSet].filter(id => chestSet.has(id)).length : 0;
+  const spacing2Count = currentChests.length - closeCount;
+
+  let maxGap = 0;
+  for (let i = 0; i < dots.length; i++) {
+    let minDist = Infinity;
+    for (const cid of currentChests) {
+      if (allDist[cid][i] < minDist) minDist = allDist[cid][i];
+    }
+    if (minDist > maxGap) maxGap = minDist;
+  }
+
+  const ringCounts = new Array(rings.length).fill(0);
+  currentChests.forEach(id => {
+    if (dots[id].ring >= 0) ringCounts[dots[id].ring]++;
+  });
+
+  const statsDiv = document.getElementById('stats');
+  statsDiv.innerHTML = `
+    <strong>Results:</strong><br>
+    Total chests: ${currentChests.length} (${spacing2Count} at spacing-2 + ${closeCount} at spacing-1)<br>
+    Max gap (furthest dot from any chest): ${maxGap} steps<br>
+    Center has chest: ${currentChests.includes(0) ? 'Yes' : 'No'}<br>
+    Per ring: ${ringCounts.map((c, i) => `R${i+1}:${c}`).join(' | ')}<br>
+    <span style="color:#FFD700">&#9679;</span> = spacing-2 chest &nbsp;
+    <span style="color:#FF8C00">&#9679;</span> = spacing-1 chest &nbsp;
+    <em>Click any chest to relocate it</em>
+  `;
+}
 
 // ---- EXPORT ----
 function exportSVG() {
@@ -401,7 +463,8 @@ function generate() {
     Center has chest: ${best.centerHasChest ? 'Yes' : 'No'}<br>
     Per ring: ${best.ringCounts.map((c, i) => `R${i+1}:${c}`).join(' | ')}<br>
     <span style="color:#FFD700">&#9679;</span> = spacing-2 chest &nbsp;
-    <span style="color:#FF8C00">&#9679;</span> = spacing-1 chest (adjacent pair)
+    <span style="color:#FF8C00">&#9679;</span> = spacing-1 chest &nbsp;
+    <em>Click any chest to relocate it</em>
   `;
 }
 
