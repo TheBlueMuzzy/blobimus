@@ -356,15 +356,21 @@ let currentCloseChestSet = null;
 
 // ---- EXPORT ----
 function exportSVG() {
-  let svgContent = '<svg viewBox="-520 -520 1040 1040" xmlns="http://www.w3.org/2000/svg">\n';
+  let svgContent = '<?xml version="1.0" encoding="UTF-8"?>\n';
+  svgContent += '<svg viewBox="-520 -520 1040 1040" xmlns="http://www.w3.org/2000/svg">\n';
   currentChests.forEach(id => {
     const d = dots[id];
     svgContent += `  <circle cx="${d.x.toFixed(2)}" cy="${d.y.toFixed(2)}" r="8" fill="#FFD700" stroke="#B8860B" stroke-width="2"/>\n`;
   });
   svgContent += '</svg>';
 
-  document.getElementById('stats').innerHTML += '<br><br><strong>Chest SVG (copy this):</strong><pre style="max-height:300px;overflow:auto;background:#333;padding:10px">' +
-    svgContent.replace(/</g, '&lt;') + '</pre>';
+  const blob = new Blob([svgContent], { type: 'image/svg+xml' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'radial-chests.svg';
+  a.click();
+  URL.revokeObjectURL(url);
 }
 
 // ---- MAIN ----
