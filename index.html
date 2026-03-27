@@ -343,42 +343,58 @@ let currentCloseChestSet = null;
 
 // ---- CLICK TO RELOCATE ----
 function relocateChest(oldId) {
+  const isCloseChest = currentCloseChestSet && currentCloseChestSet.has(oldId);
   const chestSet = new Set(currentChests);
 
   // Remove the clicked chest
   chestSet.delete(oldId);
   if (currentCloseChestSet) currentCloseChestSet.delete(oldId);
 
-  // Find valid new positions: not already a chest, respects min spacing 2 from others
   const candidates = [];
-  for (let i = 0; i < dots.length; i++) {
-    if (chestSet.has(i)) continue;
-    let tooClose = false;
-    for (const cid of chestSet) {
-      if (allDist[cid][i] < 2) { tooClose = true; break; }
+
+  if (isCloseChest) {
+    // Spacing-1 chest: must relocate to a dot adjacent to a spacing-2 (yellow) chest
+    for (let i = 0; i < dots.length; i++) {
+      if (chestSet.has(i)) continue;
+      // Must be adjacent to a yellow chest (not another orange one)
+      const adjacentYellow = dots[i].neighbors.some(nid =>
+        chestSet.has(nid) && !(currentCloseChestSet && currentCloseChestSet.has(nid))
+      );
+      if (!adjacentYellow) continue;
+      // Must not be adjacent to another orange chest
+      const adjacentOrange = dots[i].neighbors.some(nid =>
+        currentCloseChestSet && currentCloseChestSet.has(nid)
+      );
+      if (adjacentOrange) continue;
+      const rScore = radialLineScore(i, [...chestSet], 8);
+      candidates.push({ id: i, rScore });
     }
-    if (tooClose) continue;
-    // Score by radial alignment (lower = better)
-    const rScore = radialLineScore(i, [...chestSet], 8);
-    candidates.push({ id: i, rScore });
+  } else {
+    // Spacing-2 chest: find valid positions with min spacing 2 from other chests
+    for (let i = 0; i < dots.length; i++) {
+      if (chestSet.has(i)) continue;
+      let tooClose = false;
+      for (const cid of chestSet) {
+        if (allDist[cid][i] < 2) { tooClose = true; break; }
+      }
+      if (tooClose) continue;
+      const rScore = radialLineScore(i, [...chestSet], 8);
+      candidates.push({ id: i, rScore });
+    }
   }
 
-  if (candidates.length === 0) {
-    // No valid spot found, put it back
-    return;
-  }
+  if (candidates.length === 0) return;
 
   // Sort: prefer low radial score, then shuffle among the best
   candidates.sort((a, b) => a.rScore - b.rScore);
   const bestScore = candidates[0].rScore;
   const bestCandidates = candidates.filter(c => c.rScore === bestScore);
 
-  // Pick random from best
   const pick = bestCandidates[Math.floor(Math.random() * bestCandidates.length)];
 
-  // Update currentChests
   currentChests = currentChests.filter(id => id !== oldId);
   currentChests.push(pick.id);
+  if (isCloseChest) currentCloseChestSet.add(pick.id);
 
   render(currentChests, currentCloseChestSet);
   updateStats();
