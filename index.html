@@ -1,0 +1,405 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Blobimus - Treasure Chest Placement</title>
+<style>
+  body { margin: 20px; font-family: monospace; background: #1a1a1a; color: #eee; }
+  #board { background: #fff; display: block; margin: 20px auto; }
+  #info { max-width: 800px; margin: 0 auto; }
+  button { padding: 8px 16px; margin: 4px; cursor: pointer; }
+  #stats { margin-top: 10px; }
+</style>
+</head>
+<body>
+<div id="info">
+  <h2>Blobimus Chest Placement</h2>
+  <div>
+    <div style="margin:8px 0">
+      <label>Spacing-1 ratio: <strong id="ratioLabel">10%</strong></label><br>
+      <span style="font-size:12px">All spacing-2</span>
+      <input type="range" id="ratioSlider" min="0" max="100" value="10" style="width:300px;vertical-align:middle" oninput="document.getElementById('ratioLabel').textContent=this.value+'%'">
+      <span style="font-size:12px">All spacing-1</span>
+    </div>
+    <button onclick="generate()">Regenerate</button>
+    <button onclick="exportSVG()">Export SVG</button>
+  </div>
+  <div id="stats"></div>
+</div>
+<svg id="board" viewBox="-520 -520 1040 1040" width="900" height="900" xmlns="http://www.w3.org/2000/svg"></svg>
+
+<script>
+// ---- DOT GENERATION ----
+const rings = [
+  { count: 5,  radius: 65 },
+  { count: 10, radius: 130 },
+  { count: 15, radius: 195 },
+  { count: 20, radius: 260 },
+  { count: 25, radius: 325 },
+  { count: 30, radius: 390 },
+  { count: 35, radius: 455 },
+];
+const startAngle = -90;
+
+// Build all dots with positions
+// dot = { id, ring, index, x, y, neighbors: [] }
+const dots = [];
+
+// Center dot (id=0, ring=-1)
+dots.push({ id: 0, ring: -1, index: 0, x: 0, y: 0, neighbors: [] });
+
+rings.forEach((ring, ri) => {
+  const step = 360 / ring.count;
+  for (let i = 0; i < ring.count; i++) {
+    const deg = startAngle + i * step;
+    const rad = deg * Math.PI / 180;
+    const x = ring.radius * Math.cos(rad);
+    const y = ring.radius * Math.sin(rad);
+    dots.push({
+      id: dots.length,
+      ring: ri,
+      index: i,
+      x, y,
+      neighbors: []
+    });
+  }
+});
+
+// ---- ADJACENCY GRAPH ----
+// Helper: get all dots on a given ring
+function dotsOnRing(ri) {
+  return dots.filter(d => d.ring === ri);
+}
+
+// Helper: angular distance between two dots (in degrees, 0-360)
+function angleDeg(d) {
+  return (Math.atan2(d.y, d.x) * 180 / Math.PI + 360) % 360;
+}
+
+// Helper: angular difference (shortest path)
+function angularDiff(a1, a2) {
+  let diff = Math.abs(a1 - a2) % 360;
+  return diff > 180 ? 360 - diff : diff;
+}
+
+// Connect same-ring neighbors (adjacent dots on ring)
+rings.forEach((ring, ri) => {
+  const ringDots = dotsOnRing(ri);
+  for (let i = 0; i < ringDots.length; i++) {
+    const next = (i + 1) % ringDots.length;
+    const a = ringDots[i];
+    const b = ringDots[next];
+    if (!a.neighbors.includes(b.id)) a.neighbors.push(b.id);
+    if (!b.neighbors.includes(a.id)) b.neighbors.push(a.id);
+  }
+});
+
+// Connect center to all ring 0 dots
+const ring0 = dotsOnRing(0);
+ring0.forEach(d => {
+  dots[0].neighbors.push(d.id);
+  d.neighbors.push(0);
+});
+
+// Connect adjacent rings (each dot connects to 3 closest on neighboring ring)
+for (let ri = 0; ri < rings.length - 1; ri++) {
+  const innerDots = dotsOnRing(ri);
+  const outerDots = dotsOnRing(ri + 1);
+
+  innerDots.forEach(inner => {
+    const innerAngle = angleDeg(inner);
+    // Sort outer dots by angular distance to this inner dot
+    const sorted = outerDots
+      .map(od => ({ dot: od, diff: angularDiff(angleDeg(od), innerAngle) }))
+      .sort((a, b) => a.diff - b.diff);
+    // Connect to 3 closest
+    for (let k = 0; k < 3 && k < sorted.length; k++) {
+      const od = sorted[k].dot;
+      if (!inner.neighbors.includes(od.id)) inner.neighbors.push(od.id);
+      if (!od.neighbors.includes(inner.id)) od.neighbors.push(inner.id);
+    }
+  });
+}
+
+// ---- BFS DISTANCE ----
+function bfsDistances(startId) {
+  const dist = new Array(dots.length).fill(-1);
+  dist[startId] = 0;
+  const queue = [startId];
+  let head = 0;
+  while (head < queue.length) {
+    const curr = queue[head++];
+    for (const nid of dots[curr].neighbors) {
+      if (dist[nid] === -1) {
+        dist[nid] = dist[curr] + 1;
+        queue.push(nid);
+      }
+    }
+  }
+  return dist;
+}
+
+// ---- POISSON DISK SAMPLING ON GRAPH ----
+function placeTreasures(minSpacing, maxSpacing) {
+  const isChest = new Array(dots.length).fill(false);
+  const chestIds = [];
+
+  // Shuffle dot order for randomness
+  const order = dots.map((_, i) => i);
+  for (let i = order.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [order[i], order[j]] = [order[j], order[i]];
+  }
+
+  // Greedy placement: try each dot in random order
+  for (const id of order) {
+    // Check if this dot is at least minSpacing from all existing chests
+    let tooClose = false;
+    for (const cid of chestIds) {
+      const dist = bfsDistances(cid);
+      if (dist[id] < minSpacing) {
+        tooClose = true;
+        break;
+      }
+    }
+    if (!tooClose) {
+      isChest[id] = true;
+      chestIds.push(id);
+    }
+  }
+
+  // Check coverage: find dots that are too far from any chest
+  const uncovered = [];
+  for (let i = 0; i < dots.length; i++) {
+    let minDist = Infinity;
+    for (const cid of chestIds) {
+      const dist = bfsDistances(cid);
+      if (dist[i] < minDist) minDist = dist[i];
+    }
+    if (minDist > maxSpacing) uncovered.push(i);
+  }
+
+  return { chestIds, uncovered };
+}
+
+// ---- OPTIMIZED VERSION: precompute all BFS ----
+// Since we have only 141 dots, we can precompute all-pairs distances
+const allDist = [];
+for (let i = 0; i < dots.length; i++) {
+  allDist.push(bfsDistances(i));
+}
+
+function placeTreasuresFast(closeRatio) {
+  const chestIds = [];
+  const blocked = new Array(dots.length).fill(false);
+
+  // Shuffle for randomness
+  const order = dots.map((_, i) => i);
+  for (let i = order.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [order[i], order[j]] = [order[j], order[i]];
+  }
+
+  // Phase 1: Place chests with min spacing 2
+  for (const id of order) {
+    if (blocked[id]) continue;
+    chestIds.push(id);
+    for (let j = 0; j < dots.length; j++) {
+      if (allDist[id][j] < 2) blocked[j] = true;
+    }
+  }
+
+  // Phase 2: Add more chests at min spacing 1 based on closeRatio
+  const chestSet = new Set(chestIds);
+  const candidates = [];
+  for (const id of order) {
+    if (chestSet.has(id)) continue;
+    const hasAdjacentChest = dots[id].neighbors.some(nid => chestSet.has(nid));
+    if (hasAdjacentChest) candidates.push(id);
+  }
+
+  // closeRatio 0 = no close chests, 1 = as many as possible
+  const toAdd = Math.round(chestIds.length * (closeRatio / (1 - closeRatio + 0.001)));
+
+  // Distribute spacing-1 chests evenly around the circle using angular sectors
+  // Assign each candidate an angle, then divide into sectors and pick one per sector
+  const candidatesWithAngle = candidates.map(id => {
+    const d = dots[id];
+    const angle = (Math.atan2(d.y, d.x) * 180 / Math.PI + 360) % 360;
+    return { id, angle };
+  });
+
+  // Sort by angle
+  candidatesWithAngle.sort((a, b) => a.angle - b.angle);
+
+  // Divide the circle into toAdd equal sectors, pick one candidate per sector
+  const sectorSize = 360 / Math.max(toAdd, 1);
+  const closeChestSet = new Set();
+  let added = 0;
+
+  for (let s = 0; s < toAdd; s++) {
+    const sectorStart = (s * sectorSize) % 360;
+    const sectorEnd = ((s + 1) * sectorSize) % 360;
+
+    // Find candidates in this sector
+    const inSector = candidatesWithAngle.filter(c => {
+      if (sectorStart < sectorEnd) {
+        return c.angle >= sectorStart && c.angle < sectorEnd;
+      } else {
+        // Wraps around 360
+        return c.angle >= sectorStart || c.angle < sectorEnd;
+      }
+    });
+
+    if (inSector.length === 0) continue;
+
+    // Shuffle candidates within the sector for randomness
+    for (let i = inSector.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [inSector[i], inSector[j]] = [inSector[j], inSector[i]];
+    }
+
+    // Pick first valid candidate (not adjacent to another spacing-1 chest)
+    for (const c of inSector) {
+      const tooCloseToAnother = dots[c.id].neighbors.some(nid => closeChestSet.has(nid));
+      if (tooCloseToAnother) continue;
+      chestIds.push(c.id);
+      chestSet.add(c.id);
+      closeChestSet.add(c.id);
+      added++;
+      break;
+    }
+  }
+
+  // Stats
+  let maxGap = 0;
+  for (let i = 0; i < dots.length; i++) {
+    let minDist = Infinity;
+    for (const cid of chestIds) {
+      if (allDist[cid][i] < minDist) minDist = allDist[cid][i];
+    }
+    if (minDist > maxGap) maxGap = minDist;
+  }
+
+  const ringCounts = new Array(rings.length).fill(0);
+  const closeChests = [];
+  chestIds.forEach(id => {
+    const d = dots[id];
+    if (d.ring >= 0) ringCounts[d.ring]++;
+    if (closeChestSet.has(id)) closeChests.push(id);
+  });
+
+  return { chestIds, maxGap, ringCounts, centerHasChest: chestIds.includes(0), closeChests };
+}
+
+// ---- RENDERING ----
+function render(chestIds, closeChestSet) {
+  const svg = document.getElementById('board');
+  svg.innerHTML = '';
+
+  // Draw ring circles
+  rings.forEach(ring => {
+    const c = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+    c.setAttribute('cx', 0);
+    c.setAttribute('cy', 0);
+    c.setAttribute('r', ring.radius);
+    c.setAttribute('fill', 'none');
+    c.setAttribute('stroke', '#b8b832');
+    c.setAttribute('stroke-width', '1');
+    svg.appendChild(c);
+  });
+
+  // Draw edges (subtle)
+  dots.forEach(d => {
+    d.neighbors.forEach(nid => {
+      if (nid > d.id) { // draw each edge once
+        const n = dots[nid];
+        const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+        line.setAttribute('x1', d.x);
+        line.setAttribute('y1', d.y);
+        line.setAttribute('x2', n.x);
+        line.setAttribute('y2', n.y);
+        line.setAttribute('stroke', 'rgba(180,180,50,0.15)');
+        line.setAttribute('stroke-width', '0.5');
+        svg.appendChild(line);
+      }
+    });
+  });
+
+  // Draw all dots
+  const chestSet = new Set(chestIds);
+  dots.forEach(d => {
+    const dot = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+    dot.setAttribute('cx', d.x.toFixed(2));
+    dot.setAttribute('cy', d.y.toFixed(2));
+    if (chestSet.has(d.id)) {
+      dot.setAttribute('r', 8);
+      if (closeChestSet && closeChestSet.has(d.id)) {
+        // Close-spaced chests get a different look
+        dot.setAttribute('fill', '#FF8C00');
+        dot.setAttribute('stroke', '#B8860B');
+        dot.setAttribute('stroke-width', '2');
+      } else {
+        dot.setAttribute('fill', '#FFD700');
+        dot.setAttribute('stroke', '#B8860B');
+        dot.setAttribute('stroke-width', '2');
+      }
+    } else {
+      dot.setAttribute('r', 4);
+      dot.setAttribute('fill', '#ff00ff');
+    }
+    svg.appendChild(dot);
+  });
+}
+
+let currentCloseChestSet = null;
+
+// ---- EXPORT ----
+function exportSVG() {
+  let svgContent = '<svg viewBox="-520 -520 1040 1040" xmlns="http://www.w3.org/2000/svg">\n';
+  currentChests.forEach(id => {
+    const d = dots[id];
+    svgContent += `  <circle cx="${d.x.toFixed(2)}" cy="${d.y.toFixed(2)}" r="8" fill="#FFD700" stroke="#B8860B" stroke-width="2"/>\n`;
+  });
+  svgContent += '</svg>';
+
+  document.getElementById('stats').innerHTML += '<br><br><strong>Chest SVG (copy this):</strong><pre style="max-height:300px;overflow:auto;background:#333;padding:10px">' +
+    svgContent.replace(/</g, '&lt;') + '</pre>';
+}
+
+// ---- MAIN ----
+let currentChests = [];
+
+function generate() {
+  const closeRatio = parseInt(document.getElementById('ratioSlider').value) / 100;
+
+  // Run multiple times, pick best result (lowest max gap)
+  let best = null;
+  for (let attempt = 0; attempt < 50; attempt++) {
+    const result = placeTreasuresFast(closeRatio);
+    if (!best || result.maxGap < best.maxGap) {
+      best = result;
+    }
+  }
+
+  currentChests = best.chestIds;
+  currentCloseChestSet = new Set(best.closeChests);
+  render(currentChests, currentCloseChestSet);
+
+  const statsDiv = document.getElementById('stats');
+  const spacing2Count = best.chestIds.length - best.closeChests.length;
+  statsDiv.innerHTML = `
+    <strong>Results:</strong><br>
+    Total chests: ${best.chestIds.length} (${spacing2Count} at spacing-2 + ${best.closeChests.length} at spacing-1)<br>
+    Max gap (furthest dot from any chest): ${best.maxGap} steps<br>
+    Center has chest: ${best.centerHasChest ? 'Yes' : 'No'}<br>
+    Per ring: ${best.ringCounts.map((c, i) => `R${i+1}:${c}`).join(' | ')}<br>
+    <span style="color:#FFD700">&#9679;</span> = spacing-2 chest &nbsp;
+    <span style="color:#FF8C00">&#9679;</span> = spacing-1 chest (adjacent pair)
+  `;
+}
+
+generate();
+</script>
+</body>
+</html>
